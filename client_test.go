@@ -42,7 +42,7 @@ func Init() {
 }
 
 func nc() (*http.Client, error) {
-	return New(v4s, client, service, region)
+	return New(v4s, client, service, region, nil)
 }
 
 //   _   _                ____ _ _            _

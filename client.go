@@ -1,15 +1,13 @@
 package aws_signing_client
 
 import (
-	"net/http"
-
-	"strings"
-	"time"
-
+	"bytes"
+	"context"
 	"io/ioutil"
 	"log"
-
-	"bytes"
+	"net/http"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/aws/aws-sdk-go/private/protocol/rest"
@@ -23,7 +21,18 @@ type (
 		v4        *v4.Signer
 		service   string
 		region    string
-		logger    *log.Logger
+		logger    ContextLogger
+	}
+
+	// ContextLogger is used for context-enabled logging.
+	ContextLogger interface {
+		Printf(ctx context.Context, format string, v ...interface{})
+	}
+
+	// DefaultLogger implements ContextLogger interface using log.Logger. This effectively means the context
+	// is ignored.
+	DefaultLogger struct {
+		logger *log.Logger
 	}
 
 	// MissingSignerError is an implementation of the error interface that indicates that no AWS v4.Signer was
@@ -39,11 +48,14 @@ type (
 	MissingRegionError struct{}
 )
 
-var signer *Signer
+// DefaultLogger.Printf() ignores the specified context.
+func (dl *DefaultLogger) Printf(ctx context.Context, format string, v ...interface{}) {
+	dl.logger.Printf(format, v...)
+}
 
 // New obtains an HTTP client with a RoundTripper that signs AWS requests for the provided service. An
 // existing client can be specified for the `client` value, or--if nil--a new HTTP client will be created.
-func New(v4s *v4.Signer, client *http.Client, service string, region string) (*http.Client, error) {
+func New(v4s *v4.Signer, client *http.Client, service string, region string, cl ContextLogger) (*http.Client, error) {
 	c := client
 	switch {
 	case v4s == nil:
@@ -55,76 +67,82 @@ func New(v4s *v4.Signer, client *http.Client, service string, region string) (*h
 	case c == nil:
 		c = http.DefaultClient
 	}
+
+	if cl == nil {
+		cl = &DefaultLogger{
+			logger: log.New(ioutil.Discard, "", 0),
+		}
+	}
+
 	s := &Signer{
 		transport: c.Transport,
 		v4:        v4s,
 		service:   service,
 		region:    region,
-		logger:    log.New(ioutil.Discard, "", 0),
+		logger:    cl,
 	}
 	if s.transport == nil {
 		s.transport = http.DefaultTransport
 	}
-	signer = s
 	c.Transport = s
 	return c, nil
-}
-
-// SetDebugLog sets a logger for use in debugging requests and responses.
-func SetDebugLog(l *log.Logger) {
-	signer.logger = l
 }
 
 // RoundTrip implements the http.RoundTripper interface and is used to wrap HTTP requests in order to sign them for AWS
 // API calls. The scheme for all requests will be changed to HTTPS.
 func (s *Signer) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
 	if h, ok := req.Header["Authorization"]; ok && len(h) > 0 && strings.HasPrefix(h[0], "AWS4") {
-		s.logger.Println("Received request to sign that is already signed. Skipping.")
+		s.logger.Printf(ctx, "Received request to sign that is already signed. Skipping.")
 		return s.transport.RoundTrip(req)
 	}
-	s.logger.Printf("Receiving request for signing: %+v", req)
+
 	req.URL.Scheme = "https"
 	if strings.Contains(req.URL.RawPath, "%2C") {
-		s.logger.Printf("Escaping path for URL path '%s'", req.URL.RawPath)
+		s.logger.Printf(ctx, "Escaping path for URL path '%s'", req.URL.RawPath)
 		req.URL.RawPath = rest.EscapePath(req.URL.RawPath, false)
 	}
 	t := time.Now()
 	req.Header.Set("Date", t.Format(time.RFC3339))
-	s.logger.Printf("Final request to be signed: %+v", req)
+	s.logger.Printf(ctx, "Request to be signed: %+v", req)
+
+	var latency int64
 	var err error
 	switch req.Body {
 	case nil:
-		s.logger.Println("Signing request with no body...")
+		s.logger.Printf(ctx, "Signing request with no body...")
+		start := time.Now()
 		_, err = s.v4.Sign(req, nil, s.service, s.region, t)
+		latency = int64(time.Now().Sub(start)/time.Millisecond)
 	default:
 		d, err := ioutil.ReadAll(req.Body)
 		if err != nil {
+			s.logger.Printf(ctx, "Error while attempting to read request body: '%s'", err)
 			return nil, err
 		}
 		req.Body = ioutil.NopCloser(bytes.NewReader(d))
-		s.logger.Println("Signing request with body...")
+		s.logger.Printf(ctx, "Signing request with body...")
+		start := time.Now()
 		_, err = s.v4.Sign(req, bytes.NewReader(d), s.service, s.region, t)
+		latency = int64(time.Now().Sub(start)/time.Millisecond)
 	}
+
 	if err != nil {
-		s.logger.Printf("Error while attempting to sign request: '%s'", err)
+		s.logger.Printf(ctx, "Error while attempting to sign request: '%s'", err)
 		return nil, err
 	}
-	s.logger.Printf("Signing succesful. Set header to: '%+v'", req.Header)
-	s.logger.Printf("Sending signed request to RoundTripper: %+v", req)
+	s.logger.Printf(ctx, "Signing succesful. Latency: %d ms", latency)
+
+	start := time.Now()
 	resp, err := s.transport.RoundTrip(req)
+	latency = int64(time.Now().Sub(start)/time.Millisecond)
+
 	if err != nil {
-		s.logger.Printf("Error from RoundTripper.\n\n\tResponse: %+v\n\n\tError: '%s'", resp, err)
+		s.logger.Printf(ctx, "Error from RoundTripper. Latency: %d ms, Error: %s", latency, err)
 		return resp, err
 	}
-	respBody := "<nil>"
-	if resp.Body != nil {
-		defer resp.Body.Close()
-		buf := new(bytes.Buffer)
-		buf.ReadFrom(resp.Body)
-		respBody = buf.String()
-		resp.Body = ioutil.NopCloser(bytes.NewReader(buf.Bytes()))
-	}
-	s.logger.Printf("Successful response from RoundTripper: %+v\n\nBody: '%s'\n", resp, respBody)
+
+	s.logger.Printf(ctx, "Successful response from RoundTripper. Latency: %d ms", latency)
 	return resp, nil
 }
 
